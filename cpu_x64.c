@@ -20,12 +20,21 @@ void trap(struct A64State* state) {
 
 typedef void (*jitfn_t)(struct A64State*);
 
-static void* link_and_encode(dasm_State** d) {
+static void* link_and_encode(dasm_State** d, size_t icount) {
     size_t sz;
     void* buf;
     dasm_link(d, &sz);
     buf = mmap(0, sz, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    assert(buf != (void*) -1);
+
     dasm_encode(d, buf);
+
+    uint64_t* ibuf = (uint64_t*) buf;
+    // Write the rebound table
+    for (size_t i = 0; i < icount; i++) {
+        ibuf[i] = (uint64_t) buf + dasm_getpclabel(d, i);
+    }
+
     mprotect(buf, sz, PROT_READ | PROT_EXEC);
     return buf;
 }
@@ -61,7 +70,7 @@ enum {
 
 |.type state, struct A64State, a64_state
 
-static int preg(uint8_t a64_reg) {
+static int preg(uint8_t a64_reg, uint8_t tmp) {
     switch (a64_reg) {
     case DA_GP(0):
         return 7; // rdi
@@ -71,33 +80,41 @@ static int preg(uint8_t a64_reg) {
         return 2; // rdx
     case DA_GP(3):
         return 1; // rcx
+    case DA_GP(30):
+        return 3; // rbx
     }
-    return -1;
+    return tmp;
 }
 
 static int reg(dasm_State** Dst, uint8_t a64_reg, uint8_t tmp) {
-    int r = preg(a64_reg);
-    if (r >= 0)
+    int r = preg(a64_reg, tmp);
+    if (r != tmp)
         return r;
     | mov Rq(tmp), state->regs[a64_reg]
     return tmp;
 }
 
 static void regwr(dasm_State** Dst, uint8_t a64_reg, uint8_t tmp) {
-    int r = preg(a64_reg);
-    if (r >= 0)
+    int r = preg(a64_reg, tmp);
+    if (r != tmp)
         return;
     | mov state->regs[a64_reg], Rq(tmp)
 }
 
-static void movconst(dasm_State** Dst, uint8_t x64_reg, uint64_t uimm) {
+static void movconst(dasm_State** Dst, uint8_t a64_reg, uint64_t uimm, uint8_t tmp) {
+    uint8_t x64_reg = preg(a64_reg, tmp);
     if (uimm <= 0xffffffff)
         | mov Rq(x64_reg), uimm
     else
         | mov64 Rq(x64_reg), uimm
+    regwr(Dst, a64_reg, tmp);
 }
 
-static jitfn_t compile(const char* buf, size_t size) {
+static size_t tolbl(size_t pc, size_t pcstart) {
+    return (pc-pcstart)/sizeof(uint32_t);
+}
+
+static jitfn_t compile(const char* buf, size_t size, size_t pcstart) {
     dasm_State* d;
 
     const uint32_t* code = (const uint32_t*) buf;
@@ -113,11 +130,19 @@ static jitfn_t compile(const char* buf, size_t size) {
 
     dasm_State** Dst = &d;
     |.code
+    |->rbt:
+
+    // rebound table
+    for (size_t pcinst = 0; pcinst < n; pcinst++) {
+        // emit a zero word that will be filled in after encoding
+        | .byte 0x00, 0x000, 0x000, 0x00, 0x00, 0x00, 0x00, 0x00
+    }
+
     |->entry:
     | mov a64_state, rdi
     | mov rdi, 0
     for (size_t pcinst = 0; pcinst < n; pcinst++) {
-        size_t pc = pcinst * sizeof(uint32_t);
+        size_t pc = pcstart + pcinst * sizeof(uint32_t);
         struct Da64Inst inst;
         |=>pcinst:
         da64_decode(code[pcinst], &inst);
@@ -133,11 +158,10 @@ static jitfn_t compile(const char* buf, size_t size) {
         case DA64I_MOVZ:
             assert(inst.ops[1].type == DA_OP_UIMMSHIFT);
             uint64_t uimm = inst.ops[1].uimm16 << inst.ops[1].immshift.shift;
-            movconst(Dst, reg(Dst, inst.ops[0].reg, TMP1), uimm);
+            movconst(Dst, inst.ops[0].reg, uimm, TMP1);
             break;
         case DA64I_ADR:
-            movconst(Dst, reg(Dst, inst.ops[0].reg, TMP1), pc+inst.imm64);
-            regwr(Dst, inst.ops[0].reg, TMP1);
+            movconst(Dst, inst.ops[0].reg, pc+inst.imm64, TMP1);
             break;
         case DA64I_STR_IMM:
             | mov [Rq(reg(Dst, inst.ops[1].reg, TMP1))+inst.ops[1].uimm16], Rq(reg(Dst, inst.ops[0].reg, TMP2))
@@ -146,12 +170,32 @@ static jitfn_t compile(const char* buf, size_t size) {
             | mov Rq(reg(Dst, inst.ops[0].reg, TMP2)), [Rq(reg(Dst, inst.ops[1].reg, TMP1))]
             regwr(Dst, inst.ops[0].reg, TMP1);
             break;
+        case DA64I_B:
+            | jmp =>tolbl(pc+inst.imm64, pcstart)
+            break;
+        case DA64I_BL:
+            movconst(Dst, 30, pc+4, TMP1);
+            | jmp =>tolbl(pc+inst.imm64, pcstart);
+            break;
+        case DA64I_BR:
+            | lea tmp2, [->rbt]
+            | jmp aword [tmp2+Rq(reg(Dst, inst.ops[0].reg, TMP1))*2-pcstart*2]
+            break;
+        case DA64I_RET:
+            | lea tmp2, [->rbt]
+            | jmp aword [tmp2+Rq(reg(Dst, inst.ops[0].reg, TMP1))*2-pcstart*2]
+            break;
+        case DA64I_BLR:
+            movconst(Dst, 30, pc+4, TMP1);
+            | lea tmp2, [->rbt]
+            | jmp aword [tmp2+Rq(reg(Dst, inst.ops[0].reg, TMP1))*2-pcstart*2]
+            break;
         default:
             fprintf(stderr, "unhandled: 0x%x\n", inst.mnem);
             return NULL;
         }
     }
-    link_and_encode(&d);
+    link_and_encode(&d, n);
     dasm_free(&d);
     return (jitfn_t) labels[lbl_entry];
 }
@@ -159,7 +203,7 @@ static jitfn_t compile(const char* buf, size_t size) {
 static void run(const char* program, size_t size) {
     struct A64State state;
     state.trap = trap;
-    compile(program, size)(&state);
+    compile(program, size, 0x410000)(&state);
 }
 
 int main(int argc, char** argv) {
@@ -173,13 +217,8 @@ int main(int argc, char** argv) {
         }
         fseek(f, 0, SEEK_END);
         sz = ftell(f);
-        program = (char*) malloc(sz);
-        fseek(f, 0, SEEK_SET);
-        ssize_t n = fread(program, 1, sz, f);
-        if (n < 0) {
-            perror("fread");
-            return 1;
-        }
+        program = mmap((void*) 0x410000, sz, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_FIXED, fileno(f), 0);
+        assert(program != (void*) -1);
         fclose(f);
         run(program, sz);
         return 0;
